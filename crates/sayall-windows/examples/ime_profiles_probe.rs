@@ -14,7 +14,7 @@ fn main() {
                     "{}\t{}\t{}\t0x{:04X}\t{}",
                     profile.name,
                     profile.clsid,
-                    profile.guid_profile,
+                    profile.profile_guid,
                     profile.lang_id,
                     profile.module_dir.as_deref().unwrap_or("-")
                 );

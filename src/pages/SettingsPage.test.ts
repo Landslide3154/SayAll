@@ -359,7 +359,18 @@ describe("settings page", () => {
       restoreDelaySeconds: 30,
     });
 
-    await selects[1].setValue("");
+    // 「几秒切回」是手输输入框（2026-10-24 用户要求），不是固定选项。
+    const delayInput = wrapper.get<HTMLInputElement>('input[name="keyboard-ime-delay"]');
+    expect(delayInput.element.value).toBe("30");
+    await delayInput.setValue("10");
+    expect(bridge.setKeyboardImeSettings).toHaveBeenLastCalledWith({
+      enabled: true,
+      target: { name: "清风输入法", clsid: "{A}", profileGuid: "{B}", langId: 2052, moduleDir: null },
+      restoreDelaySeconds: 10,
+    });
+
+    // 留空 = 不自动切回。
+    await delayInput.setValue("");
     expect(bridge.setKeyboardImeSettings).toHaveBeenLastCalledWith({
       enabled: true,
       target: { name: "清风输入法", clsid: "{A}", profileGuid: "{B}", langId: 2052, moduleDir: null },

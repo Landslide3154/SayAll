@@ -185,16 +185,6 @@ function imeOptionLabel(option: InstalledImeProfile): string {
 
 const keyboardImeSelectedKey = computed(() => imeTargetKey(keyboardImeTarget.value));
 
-const KEYBOARD_IME_DELAY_OPTIONS = [
-  { value: "0", label: "立即切回" },
-  { value: "5", label: "5 秒后" },
-  { value: "15", label: "15 秒后" },
-  { value: "30", label: "30 秒后" },
-  { value: "60", label: "1 分钟后" },
-  { value: "120", label: "2 分钟后" },
-  { value: "", label: "不自动切回" },
-];
-
 /**
  * 应用图标（2026-10-02）：占位初值取当前默认（2026-10-04 起 = 几何鸭，与后端
  * `AppSettings::default()` 同源，避免 IPC 读回前先闪一下水彩鸭）；顶级标识与
@@ -365,12 +355,23 @@ async function onKeyboardImeTargetChange(event: Event): Promise<void> {
 }
 
 async function onKeyboardImeDelayChange(event: Event): Promise<void> {
-  const raw = (event.target as HTMLSelectElement).value;
-  keyboardImeDelay.value = raw === "" ? null : Number(raw);
+  const input = event.target as HTMLInputElement;
+  const raw = input.value.trim();
+  if (raw === "") {
+    // 留空 = 不自动切回。
+    keyboardImeDelay.value = null;
+  } else {
+    const parsed = Number(raw);
+    keyboardImeDelay.value =
+      Number.isFinite(parsed) && parsed >= 0 ? Math.min(3600, Math.round(parsed)) : 30;
+  }
   await persistKeyboardImeSettings();
+  // 非法/越界输入一律回显实际生效值，避免输入框停在一个没有保存的数字上。
+  input.value = keyboardImeDelay.value === null ? "" : String(keyboardImeDelay.value);
 }
 
-async function onAppIconChange(event: Event): Promise<void> {  const desired = (event.target as HTMLInputElement).value as AppIconIdentifier;
+async function onAppIconChange(event: Event): Promise<void> {
+  const desired = (event.target as HTMLInputElement).value as AppIconIdentifier;
   const previous = appIcon.value;
   // 乐观显示：先让界面与用户点击一致（与连接页选输入工具同款），失败再回到
   // 实际生效的图标——否则失败时单选按钮会停在"点击过但没保存"的位置。
@@ -745,21 +746,23 @@ const ROW_ICONS: Record<string, { strokes: string[]; fills?: string[] }> = {
                 {{ imeOptionLabel(option) }}
               </option>
             </select>
-            <select
-              class="keyboard-ime-select"
-              aria-label="语音结束后多久切回"
-              :disabled="!keyboardImeEnabled || keyboardImeBusy"
-              :value="keyboardImeDelay === null ? '' : String(keyboardImeDelay)"
-              @change="onKeyboardImeDelayChange"
-            >
-              <option
-                v-for="option in KEYBOARD_IME_DELAY_OPTIONS"
-                :key="option.value"
-                :value="option.value"
-              >
-                {{ option.label }}
-              </option>
-            </select>
+            <span class="keyboard-ime-delay">
+              <input
+                class="keyboard-ime-delay-input"
+                type="number"
+                name="keyboard-ime-delay"
+                min="0"
+                max="3600"
+                step="1"
+                inputmode="numeric"
+                aria-label="语音结束后多少秒切回键盘输入法"
+                :disabled="!keyboardImeEnabled || keyboardImeBusy"
+                :value="keyboardImeDelay === null ? '' : String(keyboardImeDelay)"
+                @change="onKeyboardImeDelayChange"
+              />
+              <span class="keyboard-ime-delay-unit">秒后切回</span>
+            </span>
+            <span class="keyboard-ime-hint">留空表示不自动切回；0 表示语音结束后立即切回。</span>
           </div>
         </div>
         <p v-if="keyboardImeError" class="error-text" role="alert">{{ keyboardImeError }}</p>
@@ -1044,6 +1047,31 @@ const ROW_ICONS: Record<string, { strokes: string[]; fills?: string[] }> = {
 }
 .keyboard-ime-select:disabled {
   opacity: 0.55;
+}
+.keyboard-ime-delay {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--text-secondary);
+}
+.keyboard-ime-delay-input {
+  width: 76px;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-control);
+  color: var(--text-primary);
+  font-size: 12.5px;
+  text-align: right;
+}
+.keyboard-ime-delay-input:disabled {
+  opacity: 0.55;
+}
+.keyboard-ime-hint {
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  opacity: 0.8;
 }
 
 /* 应用图标：两个带预览图的选项（选中态用强调色描边，对齐 Mac appIconPreferenceRow）。 */

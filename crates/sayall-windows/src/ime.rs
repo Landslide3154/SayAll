@@ -1454,7 +1454,7 @@ mod ime_target_tests {
 pub struct InstalledImeProfile {
     pub name: String,
     pub clsid: String,
-    pub guid_profile: String,
+    pub profile_guid: String,
     pub lang_id: u16,
     /// 输入法模块所在目录名（如 `WindInput`），仅用于界面区分"名称相同/通用"的
     /// 输入法（例：清风输入法在 TSF 里的显示名是"拼音输入法"）。
@@ -1813,7 +1813,7 @@ fn sta_enumerate_ime_profiles() -> Result<Vec<InstalledImeProfile>, String> {
                     };
                     if out.iter().any(|existing| {
                         existing.clsid == guid_string(&profile.clsid)
-                            && existing.guid_profile == guid_string(&profile.guidProfile)
+                            && existing.profile_guid == guid_string(&profile.guidProfile)
                             && existing.lang_id == profile.langid
                     }) {
                         continue;
@@ -1821,7 +1821,7 @@ fn sta_enumerate_ime_profiles() -> Result<Vec<InstalledImeProfile>, String> {
                     out.push(InstalledImeProfile {
                         name,
                         clsid: guid_string(&profile.clsid),
-                        guid_profile: guid_string(&profile.guidProfile),
+                        profile_guid: guid_string(&profile.guidProfile),
                         lang_id: profile.langid,
                         module_dir: ime_module_dir(&profile.clsid),
                     });
