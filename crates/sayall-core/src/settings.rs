@@ -30,6 +30,24 @@ pub enum VoiceInputTool {
     Other,
 }
 
+/// 用户选择的键盘输入法目标（2026-10-24「键盘输入时切回」）。
+///
+/// 只承载 TSF 配置三元组（CLSID / Profile GUID / LangID）与显示名，**不含任何
+/// Windows API 调用**——枚举与激活都在 `sayall-windows::ime`，本结构只负责
+/// 持久化与跨层传递（`sayall-core` 不得依赖 Windows API 的架构边界）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImeTarget {
+    /// 显示名（枚举时读到的输入法名称，仅用于界面回显）。
+    pub name: String,
+    /// TSF 文本服务 CLSID（GUID 字符串，带大括号）。
+    pub clsid: String,
+    /// 语言配置 GUID（GUID 字符串，带大括号）。
+    pub profile_guid: String,
+    /// 语言 ID（如简体中文 0x0804）。
+    pub lang_id: u16,
+}
+
 /// 应用图标（设置页「应用图标」，2026-10-02 用户指定）。
 ///
 /// 对齐 Mac main `Sources/RemoteMic/AppIconController.swift` 的 `AppIconIdentifier`：
@@ -87,7 +105,26 @@ pub struct AppSettings {
     /// 用户从托盘或再次双击快捷方式打开。未完成首次设置或本次启动前刚完成更新时
     /// 仍会显示主面板（判定见 `sayall_windows_app` 的启动可见性）。
     pub open_window_at_launch: bool,
+    /// 「静默启动」：**只对登录自启动生效**（2026-10-24 用户定稿）。
+    ///
+    /// 开启时登录启动项写成 `"exe" --silent`，启动时带该参数即不显示主窗口、
+    /// 直接驻留托盘；手动双击图标（不带参数）仍按 `open_window_at_launch`
+    /// 决定是否显示。默认关闭。
+    pub silent_launch: bool,
     pub check_prerelease_updates: bool,
+    /// 「语音结束后切回键盘输入法」总开关（2026-10-24 用户需求）。
+    ///
+    /// 只对键盘侧生效：语音按下仍按「输入工具」切到微信/豆包；本开关决定
+    /// 语音结束后是否自动切回 `keyboard_ime_target`。默认关闭。
+    pub keyboard_ime_switch_enabled: bool,
+    /// 键盘输入法目标；`None` = 用户还没选（此时不切回）。
+    pub keyboard_ime_target: Option<ImeTarget>,
+    /// 语音结束后等待多久切回键盘输入法：`Some(0)` = 立即，
+    /// `Some(秒)` = 延迟，`None` = 不自动切回。默认 30 秒。
+    ///
+    /// 延迟是为了避免"连续两次语音之间被切走、再语音又要等切换"的滞涩
+    /// （2026-10-24 用户明确指出），该值由用户在设置页选择。
+    pub keyboard_ime_restore_delay_seconds: Option<u32>,
     /// RC003 三键增强捕获的用户意图（按键页开关）。默认 **关闭**——
     /// 只有用户主动打开过才为 true。注意它与「计划任务是否还在系统里」
     /// 是两回事：关闭开关只结束助手、任务保留（授权保留，避免重复 UAC），
@@ -131,6 +168,10 @@ impl Default for AppSettings {
             voice_input_tool: None,
             launch_at_login: false,
             open_window_at_launch: true,
+            silent_launch: false,
+            keyboard_ime_switch_enabled: false,
+            keyboard_ime_target: None,
+            keyboard_ime_restore_delay_seconds: Some(30),
             check_prerelease_updates: false,
             rc003_capture_enabled: false,
             lock_mapping_selection: true,
@@ -159,6 +200,48 @@ impl AppSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn silent_launch_and_keyboard_ime_defaults_are_off() {
+        let settings = AppSettings::default();
+        assert!(!settings.silent_launch);
+        assert!(!settings.keyboard_ime_switch_enabled);
+        assert_eq!(settings.keyboard_ime_target, None);
+        assert_eq!(settings.keyboard_ime_restore_delay_seconds, Some(30));
+    }
+
+    #[test]
+    fn keyboard_ime_settings_round_trip_and_fall_back_for_old_configs() {
+        // 老配置没有这些字段：静默关闭、延迟落回 30 秒、目标为空。
+        let raw = r#"{"schema_version":4,"gain_db":0.0,"voice_trigger_mode":"hold"}"#;
+        let decoded: AppSettings = serde_json::from_str(raw).unwrap();
+        assert!(!decoded.silent_launch);
+        assert!(!decoded.keyboard_ime_switch_enabled);
+        assert_eq!(decoded.keyboard_ime_restore_delay_seconds, Some(30));
+        assert_eq!(decoded.keyboard_ime_target, None);
+
+        let target = ImeTarget {
+            name: "清风输入法".to_owned(),
+            clsid: "{11111111-2222-3333-4444-555555555555}".to_owned(),
+            profile_guid: "{66666666-7777-8888-9999-000000000000}".to_owned(),
+            lang_id: 0x0804,
+        };
+        let settings = AppSettings {
+            silent_launch: true,
+            keyboard_ime_switch_enabled: true,
+            keyboard_ime_target: Some(target.clone()),
+            keyboard_ime_restore_delay_seconds: None,
+            ..AppSettings::default()
+        };
+        let encoded = serde_json::to_string(&settings).unwrap();
+        assert!(encoded.contains("\"silent_launch\":true"));
+        assert!(encoded.contains("\"keyboard_ime_target\""));
+        let decoded: AppSettings = serde_json::from_str(&encoded).unwrap();
+        assert!(decoded.silent_launch);
+        assert!(decoded.keyboard_ime_switch_enabled);
+        assert_eq!(decoded.keyboard_ime_target, Some(target));
+        assert_eq!(decoded.keyboard_ime_restore_delay_seconds, None);
+    }
 
     #[test]
     fn clamps_gain_and_keeps_hold_as_only_voice_mode() {

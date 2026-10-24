@@ -635,6 +635,17 @@ mod windows_impl {
         if !GATE_ACTIVE.load(Ordering::Relaxed) {
             return false;
         }
+        // 键盘输入法切回（2026-10-24）：物理键盘"文字键"的按下沿。刻意放在
+        // 门控失能检查之后——该能力与按键映射开关无关，门控关着时照样要切回。
+        // 遥控器映射键（OK/方向/音量等）由 `button_for_keyboard` 排除，避免把
+        // 遥控器操作误当成"用户在打字"。
+        if !injected
+            && is_key_down
+            && text_capable_vk(vk_code)
+            && crate::raw_input::button_for_keyboard(vk_code as u16, make_code).is_none()
+        {
+            crate::ime::note_keyboard_text_input();
+        }
         // WM_KEYDOWN=0x0100 / WM_KEYUP=0x0101（SYS 变体语义相同：仅上下沿区分）。
         let message = if is_key_down { 0x0100 } else { 0x0101 };
         if handle_shortcut_capture(vk_code, make_code, message, flags) {

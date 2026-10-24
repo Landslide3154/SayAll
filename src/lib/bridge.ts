@@ -651,6 +651,67 @@ export async function setOpenWindowAtLaunch(enabled: boolean): Promise<boolean> 
 }
 
 /**
+ * 「静默启动」（设置页「启动行为」第三项，2026-10-24）。
+ *
+ * 只对登录自启动生效：开启后开机启动不显示主窗口、直接驻留托盘；
+ * 手动双击图标仍正常显示。浏览器预览按默认返回 `false`。
+ */
+export async function getSilentLaunch(): Promise<boolean> {
+  if (!isTauriRuntime()) return false;
+  return invoke<boolean>("get_silent_launch");
+}
+
+export async function setSilentLaunch(enabled: boolean): Promise<boolean> {
+  if (!isTauriRuntime()) throw new Error("当前是浏览器预览，无法设置静默启动");
+  return invoke<boolean>("set_silent_launch", { enabled });
+}
+
+/** 键盘输入法目标（与 Rust `sayall_core::ImeTarget` 同构，字段 camelCase）。 */
+export interface ImeTarget {
+  name: string;
+  clsid: string;
+  profileGuid: string;
+  langId: number;
+}
+
+/** 系统里已安装的键盘输入法（与 Rust `InstalledImeProfile` 同构）。 */
+export interface InstalledImeProfile {
+  name: string;
+  clsid: string;
+  profileGuid: string;
+  langId: number;
+  /** 输入法模块目录名（如 `WindInput`），用于区分通用显示名；读不到为 null。 */
+  moduleDir: string | null;
+}
+
+/** 「键盘输入法」设置（与 Rust `KeyboardImeSettingsSnapshot` 同构）。 */
+export interface KeyboardImeSettings {
+  enabled: boolean;
+  target: ImeTarget | null;
+  restoreDelaySeconds: number | null;
+}
+
+export async function getKeyboardImeSettings(): Promise<KeyboardImeSettings> {
+  if (!isTauriRuntime()) {
+    return { enabled: false, target: null, restoreDelaySeconds: 30 };
+  }
+  return invoke<KeyboardImeSettings>("get_keyboard_ime_settings");
+}
+
+export async function setKeyboardImeSettings(
+  settings: KeyboardImeSettings,
+): Promise<KeyboardImeSettings> {
+  if (!isTauriRuntime()) throw new Error("当前是浏览器预览，无法设置键盘输入法");
+  return invoke<KeyboardImeSettings>("set_keyboard_ime_settings", { input: settings });
+}
+
+/** 枚举系统里已安装的键盘输入法（设置页下拉数据源）。 */
+export async function listInstalledImeProfiles(): Promise<InstalledImeProfile[]> {
+  if (!isTauriRuntime()) return [];
+  return invoke<InstalledImeProfile[]>("list_installed_ime_profiles");
+}
+
+/**
  * 本次启动前刚完成更新时的版本号（对齐 Mac `update.completed.*`）。
  *
  * Rust 侧取走即清空：同一次运行里只提示一次，重新挂载页面不会重复弹。

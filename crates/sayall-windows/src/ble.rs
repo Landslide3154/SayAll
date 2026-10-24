@@ -2230,6 +2230,8 @@ fn handle_control(
                     "chord_press result=skipped reason=report_layer_synth_active session={session_id} note=OS 已在报告层收到合成快捷键，注入路径停用"
                 ));
                 if let Some(tool) = *lock(voice_input_tool) {
+                    // 语音会话开始：取消待执行的键盘输入法切回（2026-10-24）。
+                    crate::ime::note_voice_session_started();
                     match crate::ime::ensure_session_ime(
                         tool,
                         crate::ime::ImeSwitchScope::VoicePress,
@@ -2262,6 +2264,8 @@ fn handle_control(
                 // 旧实现会把输入法切成微信）。失败仅记录提示，按原行为注入
                 // （不比现状更差）；Vokie / 其他工具返回 NotRequired，不切输入法。
                 if let Some(tool) = *lock(voice_input_tool) {
+                    // 语音会话开始：取消待执行的键盘输入法切回（2026-10-24）。
+                    crate::ime::note_voice_session_started();
                     if let Err(error) =
                         crate::ime::ensure_session_ime(tool, crate::ime::ImeSwitchScope::VoicePress)
                     {
@@ -2590,6 +2594,10 @@ fn abort_voice_session(
 /// 同时解除语音键 F5 抑制器的会话武装（覆盖停止/中止/断连/退出全部路径）。
 fn release_voice_hold_hotkey(send_input: &SendInputRuntime, held_hotkey: &mut Option<KeyChord>) {
     crate::key_suppressor::set_session_active(false);
+    // 语音会话结束（松开 / 中止 / 断连 / 退出共用这一条路径）：按用户在设置里
+    // 选的延迟安排一次键盘输入法切回（2026-10-24）。延迟期间若再次按下语音键，
+    // `note_voice_session_started` 会取消这次切回，避免来回切换的滞涩。
+    crate::ime::note_voice_session_ended();
     if let Some(chord) = held_hotkey.take() {
         // 功能点日志：释放结果（与 chord_press 成对，粘键排查的另一半）。
         let result = send_input.release(&chord);

@@ -155,11 +155,17 @@ mod windows_impl {
         Ok(command_targets_executable(&recorded, &executable))
     }
 
-    pub fn set_enabled(enabled: bool) -> Result<(), String> {
+    pub fn set_enabled(enabled: bool, silent: bool) -> Result<(), String> {
         if enabled {
             let executable: PathBuf = std::env::current_exe()
                 .map_err(|error| format!("获取应用程序路径失败：{error}"))?;
-            let command = format!("\"{}\"", executable.display());
+            // 「静默启动」把参数写进自启动命令：登录启动带 `--silent`，手动双击
+            // 图标不带——这样静默只作用于开机启动，不会让用户以为程序没反应。
+            let command = if silent {
+                format!("\"{}\" --silent", executable.display())
+            } else {
+                format!("\"{}\"", executable.display())
+            };
             let value = wide(&command);
             let name = wide(VALUE_NAME);
             let key = create_key()?;
@@ -256,6 +262,17 @@ mod windows_impl {
         }
 
         #[test]
+        fn silent_command_targets_current_executable() {
+            // 静默启动的自启动命令带 `--silent`，仍必须被识别为"指向本程序"
+            // （否则设置页会显示未开启、启动时又会重写成不带参数）。
+            let executable = Path::new("C:\\SayAll\\sayall-windows-app.exe");
+            assert!(command_targets_executable(
+                "\"C:\\SayAll\\sayall-windows-app.exe\" --silent",
+                executable
+            ));
+        }
+
+        #[test]
         fn paths_equal_normalizes_separators_and_case() {
             assert!(paths_equal("C:\\A\\b.exe", "c:/a/B.EXE"));
             assert!(!paths_equal("C:\\A\\b.exe", "C:\\A\\c.exe"));
@@ -266,12 +283,24 @@ mod windows_impl {
 #[cfg(windows)]
 pub use windows_impl::{is_enabled, set_enabled};
 
+/// 本次进程是否由「静默启动」的登录自启动命令拉起（命令里带 `--silent`）。
+///
+/// 与 `is_enabled` 分开：前者判断"登录启动项是否指向本程序"，本函数判断
+/// "这一次启动是不是登录启动"——手动双击图标不带参数，永远不会静默。
+pub fn launched_silent() -> bool {
+    args_contain_silent(std::env::args())
+}
+
+fn args_contain_silent<I: IntoIterator<Item = String>>(args: I) -> bool {
+    args.into_iter().any(|arg| arg == "--silent")
+}
+
 #[cfg(not(windows))]
 pub fn is_enabled() -> Result<bool, String> {
     Ok(false)
 }
 
 #[cfg(not(windows))]
-pub fn set_enabled(_enabled: bool) -> Result<(), String> {
+pub fn set_enabled(_enabled: bool, _silent: bool) -> Result<(), String> {
     Err("当前平台不支持开机自启动".to_owned())
 }

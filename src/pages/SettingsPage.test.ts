@@ -29,6 +29,11 @@ const bridge = vi.hoisted(() => ({
   setLaunchAtLogin: vi.fn<(enabled: boolean) => Promise<boolean>>(),
   getOpenWindowAtLaunch: vi.fn<() => Promise<boolean>>(),
   setOpenWindowAtLaunch: vi.fn<(enabled: boolean) => Promise<boolean>>(),
+  getSilentLaunch: vi.fn<() => Promise<boolean>>(),
+  setSilentLaunch: vi.fn<(enabled: boolean) => Promise<boolean>>(),
+  getKeyboardImeSettings: vi.fn<() => Promise<unknown>>(),
+  setKeyboardImeSettings: vi.fn<(settings: unknown) => Promise<unknown>>(),
+  listInstalledImeProfiles: vi.fn<() => Promise<unknown[]>>(),
   getAppIcon: vi.fn<() => Promise<"standard" | "faceted-duck">>(),
   setAppIcon: vi.fn<(identifier: "standard" | "faceted-duck") => Promise<"standard" | "faceted-duck">>(),
   restartOnboarding: vi.fn<() => Promise<{ flowVersion: number; completedVersion: number; step: string; isActive: boolean }>>(),
@@ -158,6 +163,17 @@ describe("settings page", () => {
     // 「启动时自动打开主面板」新装默认开启（与 Rust `AppSettings::default()` 同源）。
     bridge.getOpenWindowAtLaunch.mockReset().mockResolvedValue(true);
     bridge.setOpenWindowAtLaunch.mockReset();
+    // 「静默启动」新装默认关闭（只对登录自启动生效）。
+    bridge.getSilentLaunch.mockReset().mockResolvedValue(false);
+    bridge.setSilentLaunch.mockReset();
+    // 「键盘输入法」新装默认：关闭、无目标、30 秒延迟。
+    bridge.getKeyboardImeSettings.mockReset().mockResolvedValue({
+      enabled: false,
+      target: null,
+      restoreDelaySeconds: 30,
+    });
+    bridge.setKeyboardImeSettings.mockReset();
+    bridge.listInstalledImeProfiles.mockReset().mockResolvedValue([]);
     // 后端默认值（2026-10-04 起 = 几何鸭）：mock 也按新装默认返回，与
     // `AppSettings::default()` 的用例语义对齐。
     bridge.getAppIcon.mockReset().mockResolvedValue("faceted-duck");
@@ -255,12 +271,13 @@ describe("settings page", () => {
     );
   });
 
-  it("启动行为两项并排、文字在上开关在下，中间一条竖分隔线（对齐 Mac）", async () => {
+  it("启动行为三项并排、文字在上开关在下，项间竖分隔线（对齐 Mac + 静默启动）", async () => {
     const wrapper = mount(SettingsPage, { props: { runtime } });
     await flushPromises();
 
-    // Mac `SettingsView`：右侧 `HStack(spacing: 10)` 两组「标签在上、开关在下」，
-    // 中间 `Divider().frame(height: 34)`。Windows 用同样的 DOM 顺序 + flex 布局。
+    // Mac `SettingsView`：右侧 `HStack(spacing: 10)` 每组「标签在上、开关在下」，
+    // 中间 `Divider().frame(height: 34)`。Windows 用同样的 DOM 顺序 + flex 布局；
+    // 2026-10-24 起第三组是「静默启动」。
     const toggles = wrapper.get(".launch-behavior-toggles");
     const children = Array.from(toggles.element.children).map((child) =>
       (child as HTMLElement).className,
@@ -269,9 +286,12 @@ describe("settings page", () => {
       "toggle-row launch-toggle",
       "launch-toggle-divider",
       "toggle-row launch-toggle",
+      "launch-toggle-divider",
+      "toggle-row launch-toggle",
     ]);
-    expect(toggles.findAll(".launch-toggle")).toHaveLength(2);
-    expect(toggles.get(".launch-toggle-divider").attributes("aria-hidden")).toBe("true");
+    expect(toggles.findAll(".launch-toggle")).toHaveLength(3);
+    expect(toggles.findAll(".launch-toggle-divider")).toHaveLength(2);
+    expect(wrapper.get('input[name="silent-launch"]')).toBeTruthy();
   });
 
   it("启动行为说明句与悬停提示取 Mac 原文（托盘替换菜单栏）", async () => {
@@ -299,6 +319,54 @@ describe("settings page", () => {
     await flushPromises();
     expect(toggle.element.checked).toBe(false);
   });
+
+  it("静默启动默认关闭，切换后保存并回显返回值", async () => {
+    bridge.setSilentLaunch.mockResolvedValue(true);
+    const wrapper = mount(SettingsPage, { props: { runtime } });
+    await flushPromises();
+
+    const toggle = wrapper.get<HTMLInputElement>('input[name="silent-launch"]');
+    expect(toggle.element.checked).toBe(false);
+
+    await toggle.setValue(true);
+    expect(bridge.setSilentLaunch).toHaveBeenCalledWith(true);
+    await flushPromises();
+    expect(toggle.element.checked).toBe(true);
+  });
+
+  it("键盘输入法：开关、目标与延迟任一变更都整体保存", async () => {
+    bridge.listInstalledImeProfiles.mockResolvedValue([
+      { name: "清风输入法", clsid: "{A}", profileGuid: "{B}", langId: 2052, moduleDir: null },
+    ]);
+    bridge.setKeyboardImeSettings.mockImplementation(async (input) => input);
+    const wrapper = mount(SettingsPage, { props: { runtime } });
+    await flushPromises();
+
+    const enabled = wrapper.get<HTMLInputElement>('input[name="keyboard-ime-enabled"]');
+    await enabled.setValue(true);
+    expect(bridge.setKeyboardImeSettings).toHaveBeenLastCalledWith({
+      enabled: true,
+      target: null,
+      restoreDelaySeconds: 30,
+    });
+    await flushPromises();
+
+    const selects = wrapper.findAll(".keyboard-ime-select");
+    await selects[0].setValue("{A}|{B}|2052");
+    expect(bridge.setKeyboardImeSettings).toHaveBeenLastCalledWith({
+      enabled: true,
+      target: { name: "清风输入法", clsid: "{A}", profileGuid: "{B}", langId: 2052, moduleDir: null },
+      restoreDelaySeconds: 30,
+    });
+
+    await selects[1].setValue("");
+    expect(bridge.setKeyboardImeSettings).toHaveBeenLastCalledWith({
+      enabled: true,
+      target: { name: "清风输入法", clsid: "{A}", profileGuid: "{B}", langId: 2052, moduleDir: null },
+      restoreDelaySeconds: null,
+    });
+  });
+
 
   it("启动时自动打开主面板保存失败时就地报错并保持原状态", async () => {
     bridge.setOpenWindowAtLaunch.mockRejectedValue(new Error("保存启动页面设置失败"));

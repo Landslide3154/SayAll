@@ -1180,20 +1180,26 @@ fn refocus_main_window_soon(app: tauri::AppHandle) {
 
 /// 启动时是否显示主面板（纯判定，单测覆盖）。
 ///
-/// 对齐 Mac `OnboardingLaunchPolicy.shouldShowMainWindow`：
-/// `!isComplete || completedUpdate || openMainWindowAtLaunch`。
-/// - 未完成首次设置必须显示，否则用户没有入口完成向导；
-/// - 本次启动前刚完成更新必须显示（Mac：更新完成后仍会显示主面板）；
+/// 对齐 Mac `OnboardingLaunchPolicy.shouldShowMainWindow`，并叠加 Windows 侧
+/// 的「静默启动」（2026-10-24 用户定稿）：
+/// - 未完成首次设置必须显示，否则用户没有入口完成向导（优先级最高）；
+/// - 「静默启动」只对登录自启动生效（`silent_launch` 传入时已经与
+///   `startup::launched_silent()` 做过与运算）：此时即使本次启动前刚完成更新
+///   也不弹窗——用户要的是"开机不打扰"，托盘入口仍可打开主面板；
 /// - 其余情况由「启动时自动打开主面板」决定（默认开启）。
-///
-/// 关闭该开关后，普通启动（含手动双击快捷方式）只驻留托盘；托盘左键 /
-/// 托盘菜单「显示主界面」以及再次启动应用都会把主面板显示出来。
 fn should_show_main_window_on_startup(
     onboarding_active: bool,
     completed_update: bool,
+    silent_launch: bool,
     open_window_at_launch: bool,
 ) -> bool {
-    onboarding_active || completed_update || open_window_at_launch
+    if onboarding_active {
+        return true;
+    }
+    if silent_launch {
+        return false;
+    }
+    completed_update || open_window_at_launch
 }
 
 /// 把主窗口从「最小化 / 收进托盘」恢复到可见并尝试置前（2026-10-03 用户报障：
@@ -3952,17 +3958,22 @@ fn set_launch_at_login(enabled: bool, state: tauri::State<'_, AppState>) -> Resu
         "startup feature=launch_at_login action=save phase=requested enabled={enabled}"
     ));
     let previous = startup::is_enabled().unwrap_or(false);
+    let silent = state
+        .settings
+        .load()
+        .map(|settings| settings.silent_launch)
+        .unwrap_or(false);
     let result = (|| {
-        startup::set_enabled(enabled)?;
+        startup::set_enabled(enabled, silent)?;
         if let Err(error) = state.settings.save_launch_at_login(enabled) {
-            let _ = startup::set_enabled(previous);
+            let _ = startup::set_enabled(previous, silent);
             return Err(error);
         }
         Ok(enabled)
     })();
     sayall_windows::gatt_note(match &result {
         Ok(enabled) => format!(
-            "startup feature=launch_at_login action=save phase=completed terminal_result=passed enabled={} elapsed_ms={}",
+            "startup feature=launch_at_login action=save phase=completed terminal_result=passed enabled={} silent={silent} elapsed_ms={}",
             enabled,
             started.elapsed().as_millis()
         ),
@@ -3974,10 +3985,157 @@ fn set_launch_at_login(enabled: bool, state: tauri::State<'_, AppState>) -> Resu
     result
 }
 
+/// 「静默启动」开关（只对登录自启动生效，2026-10-24 用户定稿）。
+#[tauri::command]
+fn get_silent_launch(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    let started = std::time::Instant::now();
+    let result = state
+        .settings
+        .load()
+        .map(|settings| settings.silent_launch);
+    match &result {
+        Ok(enabled) => sayall_windows::gatt_note(format!(
+            "startup feature=silent_launch action=load terminal_result=passed enabled={enabled} elapsed_ms={}",
+            started.elapsed().as_millis()
+        )),
+        Err(_) => sayall_windows::gatt_note(format!(
+            "startup feature=silent_launch action=load terminal_result=failed error_domain=settings error_code=load_failed retryable=true elapsed_ms={}",
+            started.elapsed().as_millis()
+        )),
+    }
+    result
+}
+
+#[tauri::command]
+fn set_silent_launch(enabled: bool, state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    let started = std::time::Instant::now();
+    sayall_windows::gatt_note(format!(
+        "startup feature=silent_launch action=save phase=requested enabled={enabled}"
+    ));
+    let launch_at_login = state
+        .settings
+        .load()
+        .map(|settings| settings.launch_at_login)
+        .unwrap_or(false);
+    let result = (|| {
+        state.settings.save_silent_launch(enabled)?;
+        // 登录自启动已开启时立即重写注册表，让 `--silent` 参数当场生效；
+        // 关闭时同样重写（去掉参数），避免下次启动仍被静默。
+        if launch_at_login {
+            startup::set_enabled(true, enabled)?;
+        }
+        Ok(enabled)
+    })();
+    sayall_windows::gatt_note(match &result {
+        Ok(enabled) => format!(
+            "startup feature=silent_launch action=save phase=completed terminal_result=passed enabled={enabled} launch_at_login={launch_at_login} elapsed_ms={}",
+            started.elapsed().as_millis()
+        ),
+        Err(_) => format!(
+            "startup feature=silent_launch action=save phase=completed terminal_result=failed error_domain=settings error_code=save_failed retryable=true elapsed_ms={}",
+            started.elapsed().as_millis()
+        ),
+    });
+    result
+}
+
+/// 把设置里的「键盘输入法」目标推给平台层（启动与设置变更共用）。
+///
+/// 纯转发：GUID 字符串在 `sayall-windows::ime` 里解析，非法值等于没选目标
+/// （不 panic、不阻断启动）。
+fn apply_keyboard_ime_settings(settings: &sayall_core::AppSettings) {
+    let target = if settings.keyboard_ime_switch_enabled {
+        settings.keyboard_ime_target.as_ref().and_then(|target| {
+            sayall_windows::keyboard_target_from_parts(
+                &target.name,
+                &target.clsid,
+                &target.profile_guid,
+                target.lang_id,
+            )
+        })
+    } else {
+        None
+    };
+    let delay = target.as_ref().and_then(|_| {
+        settings
+            .keyboard_ime_restore_delay_seconds
+            .map(|seconds| std::time::Duration::from_secs(u64::from(seconds)))
+    });
+    sayall_windows::configure_keyboard_ime(target, delay);
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KeyboardImeSettingsSnapshot {
+    enabled: bool,
+    target: Option<sayall_core::ImeTarget>,
+    restore_delay_seconds: Option<u32>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KeyboardImeSettingsInput {
+    enabled: bool,
+    target: Option<sayall_core::ImeTarget>,
+    restore_delay_seconds: Option<u32>,
+}
+
+/// 「键盘输入法」设置读回（设置页「通用」区块）。
+#[tauri::command]
+fn get_keyboard_ime_settings(
+    state: tauri::State<'_, AppState>,
+) -> Result<KeyboardImeSettingsSnapshot, String> {
+    let settings = state.settings.load()?;
+    Ok(KeyboardImeSettingsSnapshot {
+        enabled: settings.keyboard_ime_switch_enabled,
+        target: settings.keyboard_ime_target,
+        restore_delay_seconds: settings.keyboard_ime_restore_delay_seconds,
+    })
+}
+
+/// 「键盘输入法」设置保存：落盘后立刻推给平台层，无需重启应用。
+#[tauri::command]
+fn set_keyboard_ime_settings(
+    input: KeyboardImeSettingsInput,
+    state: tauri::State<'_, AppState>,
+) -> Result<KeyboardImeSettingsSnapshot, String> {
+    let started = std::time::Instant::now();
+    sayall_windows::gatt_note(format!(
+        "ime_keyboard action=save phase=requested enabled={} target_present={} delay_s={:?}",
+        input.enabled,
+        input.target.is_some(),
+        input.restore_delay_seconds
+    ));
+    state.settings.save_keyboard_ime_settings(
+        input.enabled,
+        input.target,
+        input.restore_delay_seconds,
+    )?;
+    let saved = state.settings.load()?;
+    apply_keyboard_ime_settings(&saved);
+    sayall_windows::gatt_note(format!(
+        "ime_keyboard action=save phase=completed terminal_result=passed enabled={} target_present={} delay_s={:?} elapsed_ms={}",
+        saved.keyboard_ime_switch_enabled,
+        saved.keyboard_ime_target.is_some(),
+        saved.keyboard_ime_restore_delay_seconds,
+        started.elapsed().as_millis()
+    ));
+    Ok(KeyboardImeSettingsSnapshot {
+        enabled: saved.keyboard_ime_switch_enabled,
+        target: saved.keyboard_ime_target,
+        restore_delay_seconds: saved.keyboard_ime_restore_delay_seconds,
+    })
+}
+
+/// 系统里已安装的键盘输入法（设置页下拉数据源）。
+#[tauri::command]
+fn list_installed_ime_profiles() -> Result<Vec<sayall_windows::InstalledImeProfile>, String> {
+    sayall_windows::list_installed_ime_profiles()
+}
+
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum ThemeAction {
-    Initialize,
+enum ThemeAction {    Initialize,
     Change,
 }
 
@@ -4621,6 +4779,9 @@ pub fn run() {
             #[cfg(windows)]
             app_icon::apply(app.handle(), saved_settings.app_icon);
 
+            // 「键盘输入法」：把语音结束后的切回目标推给平台层（2026-10-24）。
+            apply_keyboard_ime_settings(&saved_settings);
+
             // 「本次启动前刚完成更新」（2026-10-19，对齐 Mac
             // `recordLaunchAndDetectCompletedUpdate`）：记录写在独立的
             // `launch-state.json`（不碰 settings.json，安装生命周期测试对后者做逐字节
@@ -4655,9 +4816,11 @@ pub fn run() {
             //
             // 仿真构建不隐藏：CI 的 runtime simulation 依赖窗口里的 WebView 完成
             // 页面旅程，隐藏窗口会让 WebView2 进入后台节流，报告可能写不出来。
+            let silent_launch_active = saved_settings.silent_launch && startup::launched_silent();
             let show_main_window_on_startup = should_show_main_window_on_startup(
                 onboarding_active,
                 completed_update,
+                silent_launch_active,
                 saved_settings.open_window_at_launch,
             );
             #[cfg(feature = "runtime-simulation")]
@@ -4672,11 +4835,13 @@ pub fn run() {
                     let _ = window.set_focus();
                     let visible_after = window.is_visible().unwrap_or(true);
                     sayall_windows::gatt_note(format!(
-                        "startup feature=main_window_visibility action=decide terminal_result={} visible={} reason={} onboarding_active={onboarding_active} completed_update={completed_update} open_window_at_launch={} show_result={show_result:?} visible_before={visible_before} visible_after={visible_after}",
+                        "startup feature=main_window_visibility action=decide terminal_result={} visible={} reason={} silent_launch={silent_launch_active} onboarding_active={onboarding_active} completed_update={completed_update} open_window_at_launch={} show_result={show_result:?} visible_before={visible_before} visible_after={visible_after}",
                         if visible_after { "passed" } else { "failed" },
                         visible_after,
                         if onboarding_active {
                             "onboarding_active"
+                        } else if silent_launch_active {
+                            "silent_launch"
                         } else if completed_update {
                             "completed_update"
                         } else {
@@ -4688,7 +4853,7 @@ pub fn run() {
                     let hide_result = window.hide();
                     let visible_after = window.is_visible().unwrap_or(true);
                     sayall_windows::gatt_note(format!(
-                        "startup feature=main_window_visibility action=decide terminal_result={} visible={} reason=open_window_at_launch_disabled onboarding_active={onboarding_active} completed_update={completed_update} open_window_at_launch={} hide_result={hide_result:?} visible_before={visible_before} visible_after={visible_after}",
+                        "startup feature=main_window_visibility action=decide terminal_result={} visible={} reason=open_window_at_launch_disabled silent_launch={silent_launch_active} onboarding_active={onboarding_active} completed_update={completed_update} open_window_at_launch={} hide_result={hide_result:?} visible_before={visible_before} visible_after={visible_after}",
                         if visible_after { "failed" } else { "passed" },
                         visible_after,
                         saved_settings.open_window_at_launch
@@ -4782,15 +4947,18 @@ pub fn run() {
             // 启动时把持久化偏好同步到 Windows 当前用户登录启动项；失败只记录，
             // 不阻断主程序启动，用户可在“关于”页重试。
             #[cfg(windows)]
-            if let Err(error) = startup::set_enabled(saved_settings.launch_at_login) {
+            if let Err(error) = startup::set_enabled(
+                saved_settings.launch_at_login,
+                saved_settings.silent_launch,
+            ) {
                 sayall_windows::gatt_note(
                     "startup feature=launch_at_login action=sync phase=completed terminal_result=failed error_domain=windows_registry error_code=sync_failed reason=startup_preference_not_applied retryable=true".to_owned(),
                 );
                 eprintln!("同步开机自启动设置失败：{error}");
             } else {
                 sayall_windows::gatt_note(format!(
-                    "startup feature=launch_at_login action=sync phase=completed terminal_result=passed enabled={}",
-                    saved_settings.launch_at_login
+                    "startup feature=launch_at_login action=sync phase=completed terminal_result=passed enabled={} silent={}",
+                    saved_settings.launch_at_login, saved_settings.silent_launch
                 ));
             }
             // 2026-10-14：原先在此预热并缓存 Radio 对象（供自动关开无线电
@@ -5172,6 +5340,11 @@ pub fn run() {
         get_launch_at_login,
         set_launch_at_login,
         get_open_window_at_launch,
+        get_silent_launch,
+        set_silent_launch,
+        get_keyboard_ime_settings,
+        set_keyboard_ime_settings,
+        list_installed_ime_profiles,
         set_open_window_at_launch,
         take_update_completed_version,
         report_theme_result,
@@ -5290,6 +5463,11 @@ pub fn run() {
         get_launch_at_login,
         set_launch_at_login,
         get_open_window_at_launch,
+        get_silent_launch,
+        set_silent_launch,
+        get_keyboard_ime_settings,
+        set_keyboard_ime_settings,
+        list_installed_ime_profiles,
         set_open_window_at_launch,
         take_update_completed_version,
         report_theme_result,
@@ -5399,14 +5577,21 @@ mod tests {
     #[test]
     fn startup_visibility_follows_onboarding_and_preference() {
         // 未完成向导：无论开关与更新状态都显示。
-        assert!(should_show_main_window_on_startup(true, false, true));
-        assert!(should_show_main_window_on_startup(true, false, false));
-        assert!(should_show_main_window_on_startup(true, true, false));
+        assert!(should_show_main_window_on_startup(true, false, false, true));
+        assert!(should_show_main_window_on_startup(true, false, false, false));
+        assert!(should_show_main_window_on_startup(true, true, true, false));
         // 已完成向导 + 普通启动：只看开关。
-        assert!(should_show_main_window_on_startup(false, false, true));
-        assert!(!should_show_main_window_on_startup(false, false, false));
+        assert!(should_show_main_window_on_startup(false, false, false, true));
+        assert!(!should_show_main_window_on_startup(
+            false, false, false, false
+        ));
         // 已完成向导 + 本次启动前刚完成更新：开关关着也必须显示（Mac 同款）。
-        assert!(should_show_main_window_on_startup(false, true, false));
+        assert!(should_show_main_window_on_startup(false, true, false, false));
+        // 静默启动（登录自启动 + 开关）：更新完成也不弹窗（2026-10-24 用户定稿）。
+        assert!(!should_show_main_window_on_startup(false, true, true, true));
+        assert!(!should_show_main_window_on_startup(false, false, true, true));
+        // 静默只对登录启动生效：手动启动时 silent=false，仍按开关显示。
+        assert!(should_show_main_window_on_startup(false, false, false, true));
     }
 
     #[test]

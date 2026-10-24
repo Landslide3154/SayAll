@@ -1,7 +1,8 @@
 use sayall_core::{
     export_portable_library, import_portable_library, merge_library, normalize_gain_db,
-    validate_library, AppIconIdentifier, AppSettings, MacroLibraryDocument, ThemePreference,
-    UsageStatistics, VoiceInputTool, MACRO_LIBRARY_FORMAT_VERSION, PORTABLE_MAX_BYTES,
+    validate_library, AppIconIdentifier, AppSettings, ImeTarget, MacroLibraryDocument,
+    ThemePreference, UsageStatistics, VoiceInputTool, MACRO_LIBRARY_FORMAT_VERSION,
+    PORTABLE_MAX_BYTES,
 };
 use sayall_windows::send_input::{
     ButtonMappings, KeyChord, KeyCode, BUTTON_MAPPINGS_SCHEMA_VERSION,
@@ -88,6 +89,30 @@ impl SettingsStore {
     pub fn save_open_window_at_launch(&self, enabled: bool) -> Result<(), String> {
         self.update("保存启动时打开主面板设置", move |settings| {
             settings.open_window_at_launch = enabled;
+        })
+    }
+
+    /// 「静默启动」：只对登录自启动生效（自启动命令带 `--silent`），默认关闭。
+    pub fn save_silent_launch(&self, enabled: bool) -> Result<(), String> {
+        self.update("保存静默启动设置", move |settings| {
+            settings.silent_launch = enabled;
+        })
+    }
+
+    /// 「键盘输入法」设置：开关 + 目标 + 语音结束后的切回延迟（一次提交三项）。
+    ///
+    /// 三项在界面上属于同一区块，合并保存避免"只写了一半"的中间态：
+    /// 例如目标已选、开关未落盘时，语音结束后的切回定时器会按旧值运行。
+    pub fn save_keyboard_ime_settings(
+        &self,
+        enabled: bool,
+        target: Option<ImeTarget>,
+        restore_delay_seconds: Option<u32>,
+    ) -> Result<(), String> {
+        self.update("保存键盘输入法设置", move |settings| {
+            settings.keyboard_ime_switch_enabled = enabled;
+            settings.keyboard_ime_target = target;
+            settings.keyboard_ime_restore_delay_seconds = restore_delay_seconds;
         })
     }
 
@@ -1366,6 +1391,41 @@ mod tests {
 
         store.save_open_window_at_launch(true).unwrap();
         assert!(store.load().unwrap().open_window_at_launch);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn silent_launch_and_keyboard_ime_settings_persist() {
+        let path = std::env::temp_dir().join(format!(
+            "sayall-test-silent-launch-ime-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = SettingsStore::new(path.clone());
+
+        let fresh = store.load().unwrap();
+        assert!(!fresh.silent_launch);
+        assert!(!fresh.keyboard_ime_switch_enabled);
+        assert_eq!(fresh.keyboard_ime_target, None);
+        assert_eq!(fresh.keyboard_ime_restore_delay_seconds, Some(30));
+
+        store.save_silent_launch(true).unwrap();
+        assert!(store.load().unwrap().silent_launch);
+
+        let target = ImeTarget {
+            name: "清风输入法".to_owned(),
+            clsid: "{11111111-2222-3333-4444-555555555555}".to_owned(),
+            profile_guid: "{66666666-7777-8888-9999-000000000000}".to_owned(),
+            lang_id: 0x0804,
+        };
+        store
+            .save_keyboard_ime_settings(true, Some(target.clone()), None)
+            .unwrap();
+        let saved = store.load().unwrap();
+        assert!(saved.keyboard_ime_switch_enabled);
+        assert_eq!(saved.keyboard_ime_target, Some(target));
+        assert_eq!(saved.keyboard_ime_restore_delay_seconds, None);
 
         let _ = std::fs::remove_file(path);
     }

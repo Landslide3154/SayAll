@@ -58,8 +58,11 @@ mod ime;
 /// 模块本体私有，只导出这几个入口（见 `ime` 模块头与 `ImeStatus` 的语义约定）。
 #[cfg(windows)]
 pub use ime::{
-    describe_active_ime_name, ime_status_for, ime_status_log_line, list_installed_ime_names,
-    ImeStatus, MAX_INSTALLED_IME_NAMES,
+    configure_keyboard_ime, describe_active_ime_name, ensure_session_ime,
+    ime_status_for, ime_status_log_line, keyboard_target_from_parts, list_installed_ime_names,
+    list_installed_ime_profiles, note_keyboard_text_input, note_voice_session_ended,
+    note_voice_session_started, ImeActivation, ImeStatus, InstalledImeProfile,
+    KeyboardImeTarget, MAX_INSTALLED_IME_NAMES,
 };
 
 /// 录入期让位：把录入窗口线程的输入区域临时切到非 IME 布局，使输入法的

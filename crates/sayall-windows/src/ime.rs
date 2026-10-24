@@ -278,6 +278,8 @@ pub(crate) enum ImeSwitchScope {
     VoicePress,
     /// 用户刚在连接页选中输入工具后的一次性对齐（2026-10-03，离开自身窗口焦点后执行）。
     ToolSelect,
+    /// 语音结束后的键盘输入法切回 / 键盘按键兜底（2026-10-24）。
+    Keyboard,
 }
 
 impl ImeSwitchScope {
@@ -285,6 +287,7 @@ impl ImeSwitchScope {
         match self {
             ImeSwitchScope::VoicePress => "voice_press",
             ImeSwitchScope::ToolSelect => "tool_select",
+            ImeSwitchScope::Keyboard => "keyboard",
         }
     }
 }
@@ -1430,6 +1433,496 @@ mod ime_target_tests {
     }
 }
 
+// ─── 键盘输入法：语音结束后的自动切回（2026-10-24 用户需求）─────────────
+//
+// 语义（用户定稿）：
+// - 语音输入仍按「输入工具」切到微信/豆包（既有 `ensure_session_ime`）；
+// - 语音结束后等待用户在设置里选的延迟（`None` = 不自动切回），再切回用户
+//   指定的键盘输入法（如清风输入法）——延迟用于避免"连续两次语音之间被切走、
+//   再语音又要等切换"的滞涩；
+// - 键盘出现"文字键"时兜底：取消待执行的切回并立即异步切回（不阻塞钩子、
+//   不吞键）；TSF 输入法上下文重绑是异步的（2026-10-10 实证：切换后数秒内
+//   首按可能落在旧会话），所以第一字符不保证进新输入法——正常路径由
+//   "语音结束后切回"保证；
+// - 语音会话进行中不切回；注入事件与遥控器映射键不触发。
+
+/// 系统里已安装的一个键盘输入处理器（设置页「键盘输入法」下拉用）。
+///
+/// GUID 一律用大括号字符串：跨 IPC、持久化、日志都稳定，且不依赖 Windows 类型。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstalledImeProfile {
+    pub name: String,
+    pub clsid: String,
+    pub guid_profile: String,
+    pub lang_id: u16,
+    /// 输入法模块所在目录名（如 `WindInput`），仅用于界面区分"名称相同/通用"的
+    /// 输入法（例：清风输入法在 TSF 里的显示名是"拼音输入法"）。
+    pub module_dir: Option<String>,
+}
+
+/// 用户选定的键盘输入法（语音结束后自动切回的目标）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyboardImeTarget {
+    /// 显示名（日志与诊断用；GUID 不落日志）。
+    pub label: String,
+    pub clsid: GUID,
+    pub guid_profile: GUID,
+    pub lang_id: u16,
+}
+
+/// 键盘按键触发切回的冷却：用户连续打字时不必每键都起一次 STA 线程。
+const KEYBOARD_RESTORE_COOLDOWN_MS: u64 = 3000;
+/// 延迟切回线程的检查粒度（同时保证语音中途按下能及时取消）。
+const KEYBOARD_RESTORE_TICK: Duration = Duration::from_millis(200);
+
+static KEYBOARD_TARGET: std::sync::Mutex<Option<KeyboardImeTarget>> = std::sync::Mutex::new(None);
+static KEYBOARD_RESTORE_DELAY: std::sync::Mutex<Option<Duration>> = std::sync::Mutex::new(None);
+static KEYBOARD_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static VOICE_SESSION_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static LAST_KEYBOARD_ATTEMPT_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn lock_or_recover<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 配置键盘输入法目标与语音结束后的切回延迟（app 层在启动与设置变更时调用）。
+///
+/// `target = None` 或 `restore_delay = None` 都表示"不做自动切回"：前者是用户
+/// 还没选输入法，后者是用户选了"不自动切回"。
+pub fn configure_keyboard_ime(target: Option<KeyboardImeTarget>, restore_delay: Option<Duration>) {
+    let has_target = target.is_some();
+    *lock_or_recover(&KEYBOARD_TARGET) = target;
+    *lock_or_recover(&KEYBOARD_RESTORE_DELAY) = restore_delay;
+    crate::ble::gatt_note(format!(
+        "ime_keyboard action=configure target_present={} delay_ms={}",
+        has_target,
+        restore_delay.map(|delay| delay.as_millis()).unwrap_or(0)
+    ));
+}
+
+/// 语音会话开始：取消待执行的切回（用户又按住了语音键）。
+pub fn note_voice_session_started() {
+    VOICE_SESSION_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+    KEYBOARD_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// 语音会话结束：按用户设置的延迟安排一次切回键盘输入法。
+pub fn note_voice_session_ended() {
+    VOICE_SESSION_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    let Some(delay) = *lock_or_recover(&KEYBOARD_RESTORE_DELAY) else {
+        // 用户选择"不自动切回"：不安排定时器。
+        return;
+    };
+    if lock_or_recover(&KEYBOARD_TARGET).is_none() {
+        return;
+    }
+    let generation = KEYBOARD_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    let _ = std::thread::Builder::new()
+        .name("sayall-ime-restore".to_owned())
+        .spawn(move || {
+            let deadline = std::time::Instant::now() + delay;
+            loop {
+                if KEYBOARD_GENERATION.load(std::sync::atomic::Ordering::SeqCst) != generation
+                    || VOICE_SESSION_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return;
+                }
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                std::thread::sleep((deadline - now).min(KEYBOARD_RESTORE_TICK));
+            }
+            if KEYBOARD_GENERATION.load(std::sync::atomic::Ordering::SeqCst) != generation
+                || VOICE_SESSION_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return;
+            }
+            if let Err(error) = ensure_keyboard_ime("voice_idle") {
+                crate::ble::gatt_note(format!(
+                    "ime_keyboard action=restore reason=voice_idle terminal_result=failed error_domain=tsf error_code=activation_failed retryable=true detail={error}"
+                ));
+            }
+        });
+}
+
+/// 键盘出现文字键：取消待执行的切回，并异步切回键盘输入法（不阻塞钩子）。
+pub fn note_keyboard_text_input() {
+    if VOICE_SESSION_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    if lock_or_recover(&KEYBOARD_TARGET).is_none() {
+        return;
+    }
+    KEYBOARD_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let now = current_ms();
+    let last = LAST_KEYBOARD_ATTEMPT_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if now.saturating_sub(last) < KEYBOARD_RESTORE_COOLDOWN_MS {
+        return;
+    }
+    LAST_KEYBOARD_ATTEMPT_MS.store(now, std::sync::atomic::Ordering::Relaxed);
+    let _ = std::thread::Builder::new()
+        .name("sayall-ime-keyboard".to_owned())
+        .spawn(|| {
+            if let Err(error) = ensure_keyboard_ime("keyboard_text") {
+                crate::ble::gatt_note(format!(
+                    "ime_keyboard action=restore reason=keyboard_text terminal_result=failed error_domain=tsf error_code=activation_failed retryable=true detail={error}"
+                ));
+            }
+        });
+}
+
+fn current_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 从设置里的字符串三元组构造键盘输入法目标（GUID 非法返回 None）。
+pub fn keyboard_target_from_parts(
+    name: &str,
+    clsid: &str,
+    guid_profile: &str,
+    lang_id: u16,
+) -> Option<KeyboardImeTarget> {
+    Some(KeyboardImeTarget {
+        label: name.to_owned(),
+        clsid: parse_guid(clsid)?,
+        guid_profile: parse_guid(guid_profile)?,
+        lang_id,
+    })
+}
+
+/// 切回键盘输入法（幂等；前台是本应用 WebView 时跳过）。
+fn ensure_keyboard_ime(reason: &str) -> Result<ImeActivation, String> {
+    let Some(target) = lock_or_recover(&KEYBOARD_TARGET).clone() else {
+        return Ok(ImeActivation::NotRequired);
+    };
+    if foreground_is_self() {
+        crate::ble::gatt_note(format!(
+            "ime_keyboard action=restore reason={reason} outcome=skipped_self_foreground"
+        ));
+        return Ok(ImeActivation::SkippedSelfForeground);
+    }
+    let started = std::time::Instant::now();
+    let (sender, receiver) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("sayall-ime-keyboard-activate".to_owned())
+        .spawn(move || {
+            let outcome = sta_activate_profile(
+                target.clsid,
+                target.guid_profile,
+                target.lang_id,
+                &target.label,
+                ImeSwitchScope::Keyboard,
+            );
+            let _ = sender.send(outcome);
+        })
+        .map_err(|error| format!("创建键盘输入法切换线程失败：{error}"))?;
+    let result = match receiver.recv_timeout(ACTIVATION_JOIN_TIMEOUT) {
+        Ok(result) => result,
+        Err(_) => Err("键盘输入法切换超时（500ms）".to_owned()),
+    };
+    let outcome = match &result {
+        Ok(ImeActivation::AlreadyActive) => "already_active",
+        Ok(ImeActivation::Switched) => "switched",
+        Ok(ImeActivation::SkippedSelfForeground) => "skipped_self_foreground",
+        Ok(ImeActivation::NotRequired) => "not_required",
+        Err(_) => "failed",
+    };
+    crate::ble::gatt_note(format!(
+        "ime_keyboard action=restore reason={reason} outcome={outcome} elapsed_ms={} error_domain={} error_code={} retryable={}",
+        started.elapsed().as_millis(),
+        if result.is_ok() { "none" } else { "tsf" },
+        if result.is_ok() { "none" } else { "activation_failed" },
+        result.is_err(),
+    ));
+    result
+}
+
+/// 通用 TSF 配置激活（STA 线程体）：读回 + 激活 + 重绑等待 + 自校验。
+///
+/// 与 `sta_ensure_ime` 的区别：目标配置由参数给出（CLSID / Profile GUID /
+/// LangID），不写死语音工具的固定组合；用于「键盘输入法」这类用户自选目标。
+/// 不触发 `post_switch_rebind_safeguard`——焦点往返只用于语音工具的对齐路径，
+/// 键盘路径不该在用户打字时抢焦点。
+fn sta_activate_profile(
+    clsid: GUID,
+    guid_profile: GUID,
+    lang_id: u16,
+    label: &str,
+    scope: ImeSwitchScope,
+) -> Result<ImeActivation, String> {
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+        COINIT_APARTMENTTHREADED,
+    };
+    unsafe {
+        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        // S_OK(0) 或 S_FALSE(1)（本线程已初始化）都算成功。
+        if hr.is_err() && hr != windows::core::HRESULT(1) {
+            return Err(format!("CoInitializeEx(STA) 失败：{hr:?}"));
+        }
+        let result = (|| {
+            let manager: ITfInputProcessorProfileMgr = CoCreateInstance(
+                &CLSID_TF_INPUT_PROCESSOR_PROFILES,
+                None,
+                CLSCTX_INPROC_SERVER,
+            )
+            .map_err(|error| format!("创建 TSF 配置管理器失败：{error}"))?;
+            let mut profile = TF_INPUTPROCESSORPROFILE::default();
+            let query = manager.GetActiveProfile(&GUID_TFCAT_TIP_KEYBOARD, &mut profile);
+            let active_is_target = match &query {
+                Ok(()) => profile.clsid == clsid && profile.guidProfile == guid_profile,
+                Err(_) => false,
+            };
+            crate::ble::gatt_note(format!(
+                "ime_query tool={label} ok={} active_is_target={active_is_target} active_profile_present={}",
+                query.is_ok(),
+                profile.clsid != GUID::from_u128(0),
+            ));
+            if active_is_target {
+                return Ok(ImeActivation::AlreadyActive);
+            }
+            manager
+                .ActivateProfile(
+                    TF_PROFILETYPE_INPUTPROCESSOR,
+                    lang_id,
+                    &clsid,
+                    &guid_profile,
+                    HKL::default(),
+                    TF_IPPMF_FORSESSION,
+                )
+                .map_err(|error| format!("激活 {label} 会话失败：{error}"))?;
+            // 冷切换：等目标应用完成输入法会话重绑再放行。
+            std::thread::sleep(SESSION_REBIND_SETTLE);
+            note_switch_happened();
+            let mut verified = active_profile_is(&manager, &clsid, &guid_profile);
+            let mut attempts = 1u32;
+            if !verified {
+                crate::ble::gatt_note(format!(
+                    "ime_verify scope={} attempt=1 stuck=true",
+                    scope.label(),
+                ));
+                let _ = manager.ActivateProfile(
+                    TF_PROFILETYPE_INPUTPROCESSOR,
+                    lang_id,
+                    &clsid,
+                    &guid_profile,
+                    HKL::default(),
+                    TF_IPPMF_FORSESSION,
+                );
+                std::thread::sleep(SESSION_REBIND_SETTLE);
+                note_switch_happened();
+                verified = active_profile_is(&manager, &clsid, &guid_profile);
+                attempts = 2;
+            }
+            crate::ble::gatt_note(format!(
+                "ime_verify scope={} attempt={attempts} stuck={}",
+                scope.label(),
+                !verified,
+            ));
+            if !verified {
+                return Err(format!(
+                    "{label} 切换后读回仍不是当前活动输入法（attempts={attempts}）"
+                ));
+            }
+            Ok(ImeActivation::Switched)
+        })();
+        CoUninitialize();
+        result
+    }
+}
+
+fn active_profile_is(
+    manager: &ITfInputProcessorProfileMgr,
+    clsid: &GUID,
+    guid_profile: &GUID,
+) -> bool {
+    let mut active = TF_INPUTPROCESSORPROFILE::default();
+    // 与既有读回路径同款：TSF 读回是 unsafe 调用，失败按"不是目标"处理。
+    let matched = unsafe { manager.GetActiveProfile(&GUID_TFCAT_TIP_KEYBOARD, &mut active) }
+        .is_ok();
+    matched && active.clsid == *clsid && active.guidProfile == *guid_profile
+}
+
+/// 枚举系统里已安装的键盘输入处理器（zh-CN；按名称排序、按配置去重）。
+///
+/// 与 `list_installed_ime_names` 共用同一条 TSF 扫描路径，区别只是把
+/// CLSID / Profile GUID / LangID 一并带出来，供设置页保存为切回目标。
+pub fn list_installed_ime_profiles() -> Result<Vec<InstalledImeProfile>, String> {
+    run_sta_ime_query("sayall-ime-profiles", sta_enumerate_ime_profiles)
+}
+
+fn sta_enumerate_ime_profiles() -> Result<Vec<InstalledImeProfile>, String> {
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+        COINIT_APARTMENTTHREADED,
+    };
+    unsafe {
+        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        if hr.is_err() && hr != windows::core::HRESULT(1) {
+            return Err(format!("CoInitializeEx(STA) 失败：{hr:?}"));
+        }
+        let result = (|| {
+            let manager: ITfInputProcessorProfileMgr = CoCreateInstance(
+                &CLSID_TF_INPUT_PROCESSOR_PROFILES,
+                None,
+                CLSCTX_INPROC_SERVER,
+            )
+            .map_err(|error| format!("创建 TSF 配置管理器失败：{error}"))?;
+            let profiles: ITfInputProcessorProfiles = CoCreateInstance(
+                &CLSID_TF_INPUT_PROCESSOR_PROFILES,
+                None,
+                CLSCTX_INPROC_SERVER,
+            )
+            .map_err(|error| format!("创建 TSF 配置列表接口失败：{error}"))?;
+            let Ok(enumerator) = manager.EnumProfiles(LANGID_ZH_CN) else {
+                return Ok(Vec::new());
+            };
+            let mut out: Vec<InstalledImeProfile> = Vec::new();
+            let mut batch = [TF_INPUTPROCESSORPROFILE::default(); 16];
+            let mut fetched: u32 = 0;
+            let mut scanned: usize = 0;
+            loop {
+                if enumerator.Next(&mut batch, &mut fetched).is_err() || fetched == 0 {
+                    break;
+                }
+                for profile in &batch[..fetched as usize] {
+                    scanned += 1;
+                    // 键盘布局（非输入处理器）不进列表：用户要选的是"输入法"。
+                    if profile.dwProfileType != TF_PROFILETYPE_INPUTPROCESSOR {
+                        continue;
+                    }
+                    // 触控输入 / 语音识别等系统组件注册在 0x0000：不是用户可选的
+                    // 键盘输入法，列出来只会让下拉变糊。
+                    if profile.langid != LANGID_ZH_CN {
+                        continue;
+                    }
+                    let Some(name) = profile_description(
+                        &profiles,
+                        profile.langid,
+                        &profile.clsid,
+                        &profile.guidProfile,
+                    ) else {
+                        continue;
+                    };
+                    if out.iter().any(|existing| {
+                        existing.clsid == guid_string(&profile.clsid)
+                            && existing.guid_profile == guid_string(&profile.guidProfile)
+                            && existing.lang_id == profile.langid
+                    }) {
+                        continue;
+                    }
+                    out.push(InstalledImeProfile {
+                        name,
+                        clsid: guid_string(&profile.clsid),
+                        guid_profile: guid_string(&profile.guidProfile),
+                        lang_id: profile.langid,
+                        module_dir: ime_module_dir(&profile.clsid),
+                    });
+                }
+                if (fetched as usize) < batch.len() || scanned >= MAX_SCANNED_IME_PROFILES {
+                    break;
+                }
+            }
+            out.sort_by(|left, right| left.name.cmp(&right.name));
+            Ok(out)
+        })();
+        CoUninitialize();
+        result
+    }
+}
+
+/// GUID → `{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}`（设置持久化格式，大小写稳定）。
+fn guid_string(guid: &GUID) -> String {
+    let rest = guid.data4;
+    format!(
+        "{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
+        guid.data1,
+        guid.data2,
+        guid.data3,
+        rest[0],
+        rest[1],
+        rest[2],
+        rest[3],
+        rest[4],
+        rest[5],
+        rest[6],
+        rest[7]
+    )
+}
+
+/// 输入法模块所在目录名（`HKLM\SOFTWARE\Classes\CLSID\{clsid}\InprocServer32`）。
+///
+/// 只为界面提示（例：清风输入法在 TSF 里的显示名是"拼音输入法"）；读不到返回
+/// None，不影响枚举。**只取目录名**，不把完整路径带进界面或日志。
+fn ime_module_dir(clsid: &GUID) -> Option<String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Registry::{
+        RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
+    };
+    let key = format!(
+        "SOFTWARE\\Classes\\CLSID\\{}\\InprocServer32",
+        guid_string(clsid)
+    );
+    let key_wide: Vec<u16> = key.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut buffer = [0u16; 512];
+    let mut size = (buffer.len() * std::mem::size_of::<u16>()) as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(key_wide.as_ptr()),
+            PCWSTR::null(),
+            RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ,
+            None,
+            Some(buffer.as_mut_ptr() as *mut std::ffi::c_void),
+            Some(&mut size),
+        )
+    };
+    if status.is_err() {
+        return None;
+    }
+    let units = (size as usize / std::mem::size_of::<u16>()).saturating_sub(1);
+    let path = String::from_utf16_lossy(&buffer[..units.min(buffer.len())]);
+    let path = path.trim_end_matches('\0').trim();
+    std::path::Path::new(path)
+        .parent()?
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+}
+
+/// `{xxxxxxxx-…}` → GUID（大小写不敏感；格式不对返回 None，绝不 panic）。
+fn parse_guid(value: &str) -> Option<GUID> {
+    let trimmed = value.trim().trim_start_matches('{').trim_end_matches('}');
+    let mut parts = trimmed.split('-');
+    let data1 = u32::from_str_radix(parts.next()?, 16).ok()?;
+    let data2 = u16::from_str_radix(parts.next()?, 16).ok()?;
+    let data3 = u16::from_str_radix(parts.next()?, 16).ok()?;
+    let fourth = parts.next()?;
+    let fifth = parts.next()?;
+    if parts.next().is_some() || fourth.len() != 4 || fifth.len() != 12 {
+        return None;
+    }
+    let mut data4 = [0u8; 8];
+    for (index, pair) in fourth.as_bytes().chunks_exact(2).enumerate() {
+        data4[index] = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+    }
+    for (index, pair) in fifth.as_bytes().chunks_exact(2).enumerate() {
+        data4[index + 2] = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+    }
+    Some(GUID {
+        data1,
+        data2,
+        data3,
+        data4,
+    })
+}
+
 /// 输入法状态的**纯逻辑**测试（2026-10-13）。
 ///
 /// 只测不碰 COM 的部分：真机 TSF 读取（`describe_active_ime_name` /
@@ -1440,10 +1933,44 @@ mod ime_target_tests {
 #[cfg(test)]
 mod ime_status_tests {
     use super::{
-        ime_status_log_line, judge_matches, normalize_ime_name, normalize_installed_ime_names,
-        ImeStatus, MAX_INSTALLED_IME_NAMES,
+        guid_string, ime_status_log_line, judge_matches, keyboard_target_from_parts,
+        normalize_ime_name, normalize_installed_ime_names, parse_guid, ImeStatus,
+        MAX_INSTALLED_IME_NAMES,
     };
     use sayall_core::settings::VoiceInputTool;
+    use windows::core::GUID;
+
+    #[test]
+    fn guid_string_and_parse_round_trip() {
+        let guid = GUID::from_u128(0x86598fb9_66a2_463e_b9c2_aeb906d477ad);
+        let text = guid_string(&guid);
+        assert_eq!(text, "{86598FB9-66A2-463E-B9C2-AEB906D477AD}");
+        assert_eq!(parse_guid(&text), Some(guid));
+        assert_eq!(
+            parse_guid("{86598fb9-66a2-463e-b9c2-aeb906d477ad}"),
+            Some(guid)
+        );
+        // 非法输入一律 None（设置里的坏值不能把切换路径打成 panic）。
+        assert_eq!(parse_guid("not-a-guid"), None);
+        assert_eq!(parse_guid("{86598FB9-66A2-463E-B9C2}"), None);
+        assert_eq!(parse_guid(""), None);
+    }
+
+    #[test]
+    fn keyboard_target_from_parts_rejects_invalid_guids() {
+        let target = keyboard_target_from_parts(
+            "清风输入法",
+            "{86598FB9-66A2-463E-B9C2-AEB906D477AD}",
+            "{607FDF85-FCC8-4DBD-A365-41296F980C9C}",
+            0x0804,
+        )
+        .expect("合法 GUID 应构造成功");
+        assert_eq!(target.label, "清风输入法");
+        assert_eq!(target.lang_id, 0x0804);
+
+        assert!(keyboard_target_from_parts("x", "bad", "{607FDF85-FCC8-4DBD-A365-41296F980C9C}", 0x0804).is_none());
+        assert!(keyboard_target_from_parts("x", "{86598FB9-66A2-463E-B9C2-AEB906D477AD}", "bad", 0x0804).is_none());
+    }
 
     #[test]
     fn installed_names_drop_empty_dedupe_case_insensitively_and_sort() {

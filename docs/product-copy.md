@@ -32,6 +32,8 @@
 | 语音音量（连接页「语音设备」卡） | 增益；读数写“12 dB”；说明“0 dB 保持原始音量；数值越大声音越响，也会放大环境噪声。建议先从 6–12 dB 开始。”（对齐 Mac `audio.gain.*`） | `ConnectionPage.vue`、`AppSettings.gain_db` |
 | 常用语（会员能力：按键动作 + 浮层面板） | 常用语；动作名「打开常用语」；缺私有组件时已保存的绑定显示「打开常用语（当前不可用）」；失败提示按原因分叉（见 §7 2026-10-15 条） | `src/lib/bridge.ts`（`actionSummary`）、`ButtonsPage.vue`、`SettingsPage.vue`；面板内文案在私有组件 |
 | 启动行为第二项（设置页「通用」） | 启动时自动打开主面板（对齐 Mac `about.preferences.open_main_window_at_launch`）；说明“关闭后普通启动仅保留托盘入口；更新完成后仍会显示主面板。”；新装与老配置默认开启（2026-10-19 用户定稿「照 Mac 原样」） | `SettingsPage.vue`、`AppSettings.open_window_at_launch` |
+| 启动行为第三项「静默启动」（设置页「通用」，2026-10-24 用户需求） | 静默启动；悬停提示“开启后登录启动时不显示主窗口，直接驻留托盘；手动双击图标打开应用仍会显示主窗口。”；默认关闭；只对登录自启动生效 | `SettingsPage.vue`、`AppSettings.silent_launch`、`src-tauri/src/startup.rs` |
+| 键盘输入法（设置页「通用」，2026-10-24 用户需求） | 键盘输入法；说明“语音结束后自动切回你常用的键盘输入法；再次按住语音键会切回语音输入法。”；开关「语音结束后切回」；下拉「选择键盘输入法」（显示名 + 模块目录，例「拼音输入法（WindInput）」）；延迟下拉「立即切回」「5 秒后」「15 秒后」「30 秒后」「1 分钟后」「2 分钟后」「不自动切回」（默认 30 秒） | `SettingsPage.vue`、`AppSettings.keyboard_ime_*`、`crates/sayall-windows/src/ime.rs` |
 | 更新完成提示（启动时一次性） | 标题「无线麦已更新」、正文「已成功更新到版本 {版本号}。」、按钮「好」（对齐 Mac `update.completed.*`，原样移植）；只在“本次启动前刚完成更新”时出现一次 | `UpdateCompletedDialog.vue`、`launch_state.rs` |
 | 组合动作（侧边栏页 + 按键页动作分组） | 组合动作；步骤类型写「打开应用」「等待应用」「单键或快捷键」「聚焦输入框」「聚焦学习过的输入框」「打开网址」「执行已有组合动作」（对齐 Mac `macro.step.*`；「系统与媒体动作」不再作为新步骤提供，旧数据仍可显示与执行）；终态写「组合动作执行成功」「组合动作已执行，但无法确认第三方 App 的结果」「组合动作已取消」「组合动作执行超时」等（对齐 Mac `macro.status.execution.*`） | `MacrosPage.vue`、`ButtonsPage.vue`、`src/lib/bridge.ts`（`macroActionLabel` / `macroTerminalLabel` / `macroStepSummary`） |
 

@@ -1,17 +1,28 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
-import type { AppIconIdentifier, RuntimeSnapshot, ThemePreference } from "../lib/bridge";
+import type {
+  AppIconIdentifier,
+  ImeTarget,
+  InstalledImeProfile,
+  RuntimeSnapshot,
+  ThemePreference,
+} from "../lib/bridge";
 import {
   getAppIcon,
+  getKeyboardImeSettings,
   getLaunchAtLogin,
   getMembershipAccountSummary,
   getOpenWindowAtLaunch,
+  getSilentLaunch,
+  listInstalledImeProfiles,
   openGitHubRepository,
   openOfficialWebsite,
   restartOnboarding,
   setAppIcon,
+  setKeyboardImeSettings,
   setLaunchAtLogin,
   setOpenWindowAtLaunch,
+  setSilentLaunch,
 } from "../lib/bridge";
 import type { MembershipAccountSummary } from "../lib/bridge";
 import CrownIcon from "../components/CrownIcon.vue";
@@ -138,6 +149,53 @@ const openWindowAtLaunchBusy = ref(false);
 const openWindowAtLaunchError = ref("");
 
 /**
+ * 「静默启动」（2026-10-24）：只对登录自启动生效，默认关闭。
+ * 与上面两项同样等 IPC 读回后再创建开关本体，避免闪一下关闭态。
+ */
+const silentLaunch = ref(false);
+const silentLaunchReady = ref(false);
+const silentLaunchBusy = ref(false);
+const silentLaunchError = ref("");
+
+/**
+ * 「键盘输入法」（2026-10-24）：语音结束后自动切回用户选的键盘输入法。
+ * 目标来自系统已安装输入法枚举；延迟由用户选择（含"不自动切回"）。
+ */
+const keyboardImeOptions = ref<InstalledImeProfile[]>([]);
+const keyboardImeEnabled = ref(false);
+const keyboardImeTarget = ref<ImeTarget | null>(null);
+const keyboardImeDelay = ref<number | null>(30);
+const keyboardImeReady = ref(false);
+const keyboardImeBusy = ref(false);
+const keyboardImeError = ref("");
+
+function imeTargetKey(target: ImeTarget | InstalledImeProfile | null): string {
+  return target ? `${target.clsid}|${target.profileGuid}|${target.langId}` : "";
+}
+
+/**
+ * 下拉显示名：TSF 显示名可能很通用（例：清风输入法注册为「拼音输入法」），
+ * 用模块目录名补一个可识别的括注；系统目录（system32）没有区分度，不显示。
+ */
+function imeOptionLabel(option: InstalledImeProfile): string {
+  const dir = option.moduleDir;
+  if (!dir || /^system32$/i.test(dir)) return option.name;
+  return `${option.name}（${dir}）`;
+}
+
+const keyboardImeSelectedKey = computed(() => imeTargetKey(keyboardImeTarget.value));
+
+const KEYBOARD_IME_DELAY_OPTIONS = [
+  { value: "0", label: "立即切回" },
+  { value: "5", label: "5 秒后" },
+  { value: "15", label: "15 秒后" },
+  { value: "30", label: "30 秒后" },
+  { value: "60", label: "1 分钟后" },
+  { value: "120", label: "2 分钟后" },
+  { value: "", label: "不自动切回" },
+];
+
+/**
  * 应用图标（2026-10-02）：占位初值取当前默认（2026-10-04 起 = 几何鸭，与后端
  * `AppSettings::default()` 同源，避免 IPC 读回前先闪一下水彩鸭）；顶级标识与
  * 窗口/任务栏、托盘用同一选择。
@@ -258,8 +316,61 @@ async function onOpenWindowAtLaunchChange(event: Event): Promise<void> {
   }
 }
 
-async function onAppIconChange(event: Event): Promise<void> {
-  const desired = (event.target as HTMLInputElement).value as AppIconIdentifier;
+async function onSilentLaunchChange(event: Event): Promise<void> {
+  const input = event.target as HTMLInputElement;
+  const enabled = input.checked;
+  silentLaunchBusy.value = true;
+  silentLaunchError.value = "";
+  try {
+    silentLaunch.value = await setSilentLaunch(enabled);
+  } catch (error) {
+    silentLaunchError.value = error instanceof Error ? error.message : String(error);
+    // 保存失败时把可见状态拨回实际生效值（与"启动时自动打开主面板"同款）。
+    input.checked = silentLaunch.value;
+  } finally {
+    silentLaunchBusy.value = false;
+  }
+}
+
+/** 保存键盘输入法设置：开关 / 目标 / 延迟任一项变更都整体提交。 */
+async function persistKeyboardImeSettings(): Promise<void> {
+  keyboardImeBusy.value = true;
+  keyboardImeError.value = "";
+  try {
+    const saved = await setKeyboardImeSettings({
+      enabled: keyboardImeEnabled.value,
+      target: keyboardImeTarget.value,
+      restoreDelaySeconds: keyboardImeDelay.value,
+    });
+    keyboardImeEnabled.value = saved.enabled;
+    keyboardImeTarget.value = saved.target;
+    keyboardImeDelay.value = saved.restoreDelaySeconds;
+  } catch (error) {
+    keyboardImeError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    keyboardImeBusy.value = false;
+  }
+}
+
+async function onKeyboardImeEnabledChange(event: Event): Promise<void> {
+  keyboardImeEnabled.value = (event.target as HTMLInputElement).checked;
+  await persistKeyboardImeSettings();
+}
+
+async function onKeyboardImeTargetChange(event: Event): Promise<void> {
+  const key = (event.target as HTMLSelectElement).value;
+  keyboardImeTarget.value =
+    keyboardImeOptions.value.find((option) => imeTargetKey(option) === key) ?? null;
+  await persistKeyboardImeSettings();
+}
+
+async function onKeyboardImeDelayChange(event: Event): Promise<void> {
+  const raw = (event.target as HTMLSelectElement).value;
+  keyboardImeDelay.value = raw === "" ? null : Number(raw);
+  await persistKeyboardImeSettings();
+}
+
+async function onAppIconChange(event: Event): Promise<void> {  const desired = (event.target as HTMLInputElement).value as AppIconIdentifier;
   const previous = appIcon.value;
   // 乐观显示：先让界面与用户点击一致（与连接页选输入工具同款），失败再回到
   // 实际生效的图标——否则失败时单选按钮会停在"点击过但没保存"的位置。
@@ -301,6 +412,21 @@ onMounted(() => {
     .then((enabled) => { openWindowAtLaunch.value = enabled; })
     .catch((error) => { openWindowAtLaunchError.value = error instanceof Error ? error.message : String(error); })
     .finally(() => { openWindowAtLaunchReady.value = true; });
+  void getSilentLaunch()
+    .then((enabled) => { silentLaunch.value = enabled; })
+    .catch((error) => { silentLaunchError.value = error instanceof Error ? error.message : String(error); })
+    .finally(() => { silentLaunchReady.value = true; });
+  void listInstalledImeProfiles()
+    .then((profiles) => { keyboardImeOptions.value = profiles; })
+    .catch((error) => { keyboardImeError.value = error instanceof Error ? error.message : String(error); });
+  void getKeyboardImeSettings()
+    .then((settings) => {
+      keyboardImeEnabled.value = settings.enabled;
+      keyboardImeTarget.value = settings.target;
+      keyboardImeDelay.value = settings.restoreDelaySeconds;
+    })
+    .catch((error) => { keyboardImeError.value = error instanceof Error ? error.message : String(error); })
+    .finally(() => { keyboardImeReady.value = true; });
   void getAppIcon()
     .then((identifier) => { appIcon.value = identifier; })
     .catch((error) => { appIconError.value = error instanceof Error ? error.message : String(error); })
@@ -522,6 +648,23 @@ const ROW_ICONS: Record<string, { strokes: string[]; fills?: string[] }> = {
             <span class="launch-toggle-divider" aria-hidden="true"></span>
             <label
               class="toggle-row launch-toggle"
+              title="开启后登录启动时不显示主窗口，直接驻留托盘；手动双击图标打开应用仍会显示主窗口。"
+            >
+              <span>静默启动</span>
+              <input
+                v-if="silentLaunchReady"
+                type="checkbox"
+                class="toggle-input"
+                name="silent-launch"
+                :checked="silentLaunch"
+                :disabled="silentLaunchBusy"
+                @change="onSilentLaunchChange"
+              />
+              <span v-else class="toggle-placeholder" aria-hidden="true"></span>
+            </label>
+            <span class="launch-toggle-divider" aria-hidden="true"></span>
+            <label
+              class="toggle-row launch-toggle"
               title="关闭后普通启动仅保留托盘入口；更新完成后仍会显示主面板。"
             >
               <span>启动时自动打开主面板</span>
@@ -542,6 +685,84 @@ const ROW_ICONS: Record<string, { strokes: string[]; fills?: string[] }> = {
         <p v-if="openWindowAtLaunchError" class="error-text" role="alert">
           {{ openWindowAtLaunchError }}
         </p>
+        <p v-if="silentLaunchError" class="error-text" role="alert">
+          {{ silentLaunchError }}
+        </p>
+
+        <div class="settings-row">
+          <span class="settings-row-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none">
+              <rect
+                x="3"
+                y="6"
+                width="18"
+                height="12"
+                rx="2.5"
+                stroke="currentColor"
+                stroke-width="1.9"
+              />
+              <path
+                d="M7 10h.01M11 10h.01M15 10h.01M7 14h10"
+                stroke="currentColor"
+                stroke-width="1.9"
+                stroke-linecap="round"
+              />
+            </svg>
+          </span>
+          <div class="settings-row-text">
+            <strong>键盘输入法</strong>
+            <p class="muted">
+              语音结束后自动切回你常用的键盘输入法；再次按住语音键会切回语音输入法。
+            </p>
+          </div>
+          <div class="keyboard-ime-controls">
+            <label class="toggle-row launch-toggle" title="语音结束后自动切回下面的键盘输入法。">
+              <span>语音结束后切回</span>
+              <input
+                v-if="keyboardImeReady"
+                type="checkbox"
+                class="toggle-input"
+                name="keyboard-ime-enabled"
+                :checked="keyboardImeEnabled"
+                :disabled="keyboardImeBusy"
+                @change="onKeyboardImeEnabledChange"
+              />
+              <span v-else class="toggle-placeholder" aria-hidden="true"></span>
+            </label>
+            <select
+              class="keyboard-ime-select"
+              aria-label="键盘输入法"
+              :disabled="!keyboardImeEnabled || keyboardImeBusy || keyboardImeOptions.length === 0"
+              :value="keyboardImeSelectedKey"
+              @change="onKeyboardImeTargetChange"
+            >
+              <option value="" disabled>选择键盘输入法</option>
+              <option
+                v-for="option in keyboardImeOptions"
+                :key="imeTargetKey(option)"
+                :value="imeTargetKey(option)"
+              >
+                {{ imeOptionLabel(option) }}
+              </option>
+            </select>
+            <select
+              class="keyboard-ime-select"
+              aria-label="语音结束后多久切回"
+              :disabled="!keyboardImeEnabled || keyboardImeBusy"
+              :value="keyboardImeDelay === null ? '' : String(keyboardImeDelay)"
+              @change="onKeyboardImeDelayChange"
+            >
+              <option
+                v-for="option in KEYBOARD_IME_DELAY_OPTIONS"
+                :key="option.value"
+                :value="option.value"
+              >
+                {{ option.label }}
+              </option>
+            </select>
+          </div>
+        </div>
+        <p v-if="keyboardImeError" class="error-text" role="alert">{{ keyboardImeError }}</p>
 
         <div class="settings-row">
           <span class="settings-row-icon" aria-hidden="true">
@@ -803,6 +1024,26 @@ const ROW_ICONS: Record<string, { strokes: string[]; fills?: string[] }> = {
   height: 34px;
   background: var(--border);
   align-self: center;
+}
+
+/* 键盘输入法：右侧「开关 + 两个下拉」竖排，避免与左侧说明抢宽度。 */
+.keyboard-ime-controls {
+  display: grid;
+  justify-items: end;
+  gap: 6px;
+}
+.keyboard-ime-select {
+  min-width: 156px;
+  max-width: 220px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-control);
+  color: var(--text-primary);
+  font-size: 12.5px;
+}
+.keyboard-ime-select:disabled {
+  opacity: 0.55;
 }
 
 /* 应用图标：两个带预览图的选项（选中态用强调色描边，对齐 Mac appIconPreferenceRow）。 */
